@@ -228,9 +228,29 @@ struct buffer {
 	size_t size;
 };
 
+struct dir_entry {
+	char *name;
+	struct stat stbuf;
+};
+
 struct dir_handle {
 	struct buffer buf;
 	struct conn *conn;
+	/*
+	 * Snapshot of the *current* enumeration. sshfs uses old-style readdir
+	 * over a single-pass SFTP directory handle. Each new enumeration
+	 * (offset == 0, e.g. a fresh listing or a rewinddir) re-reads the
+	 * directory from the server so newly created files and updated
+	 * attributes show up; a continuation (offset != 0) is served from this
+	 * snapshot so the listing never comes back empty when the handle has
+	 * already been exhausted. See:
+	 * https://github.com/libfuse/sshfs/issues/338
+	 */
+	GPtrArray *entries;	/* array of struct dir_entry * */
+	char *path;		/* directory path, for reopening the handle */
+	int read_err;		/* error from the last read, if any */
+	int has_handle;		/* buf holds an open SFTP dir handle to close */
+	int buf_exhausted;	/* the SFTP handle has been read to EOF */
 };
 
 struct list_head {
@@ -958,8 +978,7 @@ static int buf_get_statvfs(struct buffer *buf, struct statvfs *stbuf)
 	return 0;
 }
 
-static int buf_get_entries(struct buffer *buf, void *dbuf,
-                           fuse_fill_dir_t filler)
+static int buf_get_entries(struct buffer *buf, GPtrArray *entries)
 {
 	uint32_t count;
 	unsigned i;
@@ -978,11 +997,16 @@ static int buf_get_entries(struct buffer *buf, void *dbuf,
 			free(longname);
 			err = buf_get_attrs(buf, &stbuf, NULL);
 			if (!err) {
+				struct dir_entry *entry;
 				if (sshfs.follow_symlinks &&
 				    S_ISLNK(stbuf.st_mode)) {
 					stbuf.st_mode = 0;
 				}
-				filler(dbuf, name, &stbuf, 0, 0);
+				entry = g_new(struct dir_entry, 1);
+				entry->name = name;
+				entry->stbuf = stbuf;
+				g_ptr_array_add(entries, entry);
+				name = NULL; /* ownership passed to entry */
 			}
 		}
 		free(name);
@@ -2309,7 +2333,7 @@ static int sshfs_req_pending(struct request *req)
 }
 
 static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
-			      void *buf, off_t offset, fuse_fill_dir_t filler)
+			      GPtrArray *entries)
 {
 	int err = 0;
 	int outstanding = 0;
@@ -2318,7 +2342,6 @@ static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
 
 	int done = 0;
 
-	assert(offset == 0);
 	while (!done || outstanding) {
 		struct request *req;
 		struct buffer name;
@@ -2369,7 +2392,7 @@ static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
 				done = 1;
 			}
 			if (!done) {
-				err = buf_get_entries(&name, buf, filler);
+				err = buf_get_entries(&name, entries);
 				buf_free(&name);
 
 				/* increase number of outstanding requests */
@@ -2387,15 +2410,14 @@ static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
 }
 
 static int sftp_readdir_sync(struct conn *conn, struct buffer *handle,
-			     void *buf, off_t offset, fuse_fill_dir_t filler)
+			     GPtrArray *entries)
 {
 	int err;
-	assert(offset == 0);
 	do {
 		struct buffer name;
 		err = sftp_request(conn, SSH_FXP_READDIR, handle, SSH_FXP_NAME, &name);
 		if (!err) {
-			err = buf_get_entries(&name, buf, filler);
+			err = buf_get_entries(&name, entries);
 			buf_free(&name);
 		}
 	} while (!err);
@@ -2427,10 +2449,48 @@ static int sshfs_opendir(const char *path, struct fuse_file_info *fi)
 		handle->conn = conn;
 		handle->conn->dir_count++;
 		pthread_mutex_unlock(&sshfs.lock);
+		handle->has_handle = 1;
+		handle->path = g_strdup(path);
 		fi->fh = (unsigned long) handle;
 	} else
 		g_free(handle);
 	buf_free(&buf);
+	return err;
+}
+
+static void free_dir_entry(gpointer data)
+{
+	struct dir_entry *entry = data;
+	free(entry->name);
+	g_free(entry);
+}
+
+/*
+ * Reopen the SFTP directory handle. SFTP has no rewind, so re-reading a
+ * directory from the start means closing the exhausted handle and opening a
+ * fresh one.
+ */
+static int sshfs_reopen_dir(struct dir_handle *handle)
+{
+	struct buffer buf;
+	int err;
+
+	if (handle->has_handle) {
+		sftp_request(handle->conn, SSH_FXP_CLOSE, &handle->buf, 0, NULL);
+		/* free + reset to a clean state so sftp_request can refill it */
+		buf_clear(&handle->buf);
+		handle->has_handle = 0;
+	}
+	buf_init(&buf, 0);
+	buf_add_path(&buf, handle->path);
+	err = sftp_request(handle->conn, SSH_FXP_OPENDIR, &buf,
+			   SSH_FXP_HANDLE, &handle->buf);
+	buf_free(&buf);
+	if (!err) {
+		buf_finish(&handle->buf);
+		handle->has_handle = 1;
+		handle->buf_exhausted = 0;
+	}
 	return err;
 }
 
@@ -2439,19 +2499,54 @@ static int sshfs_readdir(const char *path, void *dbuf, fuse_fill_dir_t filler,
 			 enum fuse_readdir_flags flags)
 {
 	(void) path; (void) flags;
-	int err;
+	unsigned i;
 	struct dir_handle *handle;
 
 	handle = (struct dir_handle*) fi->fh;
 
-	if (sshfs.sync_readdir)
-		err = sftp_readdir_sync(handle->conn, &handle->buf, dbuf,
-					offset, filler);
-	else
-		err = sftp_readdir_async(handle->conn, &handle->buf, dbuf,
-					 offset, filler);
+	/*
+	 * offset == 0 starts a fresh enumeration (a new listing or a
+	 * rewinddir), so re-read the directory from the server to pick up newly
+	 * created files and updated attributes. The SFTP handle is single-pass:
+	 * once read to EOF, reusing it would read nothing and the directory
+	 * would appear empty, so we reopen a fresh handle first. offset != 0 is
+	 * a continuation of the current enumeration and is served from the
+	 * snapshot taken at offset 0.
+	 * See: https://github.com/libfuse/sshfs/issues/338
+	 */
+	if (offset == 0 || handle->entries == NULL) {
+		if (handle->buf_exhausted)
+			handle->read_err = sshfs_reopen_dir(handle);
+		if (!handle->read_err) {
+			if (handle->entries)
+				g_ptr_array_free(handle->entries, TRUE);
+			handle->entries =
+				g_ptr_array_new_with_free_func(free_dir_entry);
+			if (sshfs.sync_readdir)
+				handle->read_err = sftp_readdir_sync(
+					handle->conn, &handle->buf,
+					handle->entries);
+			else
+				handle->read_err = sftp_readdir_async(
+					handle->conn, &handle->buf,
+					handle->entries);
+			handle->buf_exhausted = 1;
+		}
+	}
 
-	return err;
+	if (handle->read_err)
+		return handle->read_err;
+
+	/*
+	 * Old-style readdir: hand FUSE the complete listing with offset 0 and
+	 * let it do the offset-based slicing itself.
+	 */
+	for (i = 0; i < handle->entries->len; i++) {
+		struct dir_entry *entry = g_ptr_array_index(handle->entries, i);
+		filler(dbuf, entry->name, &entry->stbuf, 0, 0);
+	}
+
+	return 0;
 }
 
 static int sshfs_releasedir(const char *path, struct fuse_file_info *fi)
@@ -2461,11 +2556,18 @@ static int sshfs_releasedir(const char *path, struct fuse_file_info *fi)
 	struct dir_handle *handle;
 
 	handle = (struct dir_handle*) fi->fh;
-	err = sftp_request(handle->conn, SSH_FXP_CLOSE, &handle->buf, 0, NULL);
+	err = 0;
+	if (handle->has_handle) {
+		err = sftp_request(handle->conn, SSH_FXP_CLOSE, &handle->buf,
+				   0, NULL);
+		buf_free(&handle->buf);
+	}
 	pthread_mutex_lock(&sshfs.lock);
 	handle->conn->dir_count--;
 	pthread_mutex_unlock(&sshfs.lock);
-	buf_free(&handle->buf);
+	if (handle->entries)
+		g_ptr_array_free(handle->entries, TRUE);
+	g_free(handle->path);
 	g_free(handle);
 	return err;
 }
@@ -4518,7 +4620,11 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-#if !defined(__CYGWIN__)
+	/*
+	 * On macOS the FD_CLOEXEC fcntl is deferred until after
+	 * fuse_daemonize() below; see the comment there.
+	 */
+#if !defined(__CYGWIN__) && !defined(__APPLE__)
 	res = fcntl(fuse_session_fd(se), F_SETFD, FD_CLOEXEC);
 	if (res == -1)
 		perror("WARNING: failed to set FD_CLOEXEC on fuse device");
@@ -4541,6 +4647,30 @@ int main(int argc, char *argv[])
 		fuse_destroy(fuse);
 		exit(1);
 	}
+
+#ifdef __APPLE__
+	/*
+	 * macFUSE 5.3.3+ mounts lazily: fuse_mount() only records the request,
+	 * and the real mount (and its XPC channel) is created on first use.
+	 * On macOS fuse_session_fd() is such a first use -- it triggers the
+	 * delayed mount and marks the mount as started, after which
+	 * fuse_daemonize() refuses to fork and stays in the foreground
+	 * ("daemonize requested after mount started; continuing in foreground").
+	 *
+	 * So defer the FD_CLOEXEC fcntl until here, after daemonizing: the
+	 * mount is then created in the daemon child, where its XPC connection
+	 * survives, and daemonization still forks as before. The fuse fd does
+	 * not exist yet while the first ssh child is spawned in ssh_connect()
+	 * above, so nothing can leak in that window; setting FD_CLOEXEC now
+	 * still protects the ssh children spawned later on reconnect.
+	 *
+	 * See macFUSE commit 867b5cdb ("Defer mount process until first use on
+	 * macOS") and https://github.com/libfuse/sshfs/issues/338
+	 */
+	res = fcntl(fuse_session_fd(se), F_SETFD, FD_CLOEXEC);
+	if (res == -1)
+		perror("WARNING: failed to set FD_CLOEXEC on fuse device");
+#endif
 
 	if (sshfs.singlethread)
 		res = fuse_loop(fuse);

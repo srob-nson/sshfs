@@ -8,7 +8,6 @@
 
 #include "cache.h"
 #include <stdio.h>
-#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -386,7 +385,18 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	struct node *node;
 	struct cache_dirent **cdent;
 
-	assert(offset == 0);
+	/*
+	 * sshfs uses mode-1 readdir: the offset parameter is ignored and the
+	 * complete listing is always handed to the filler with offset 0;
+	 * libfuse caches the entries and does the offset-based slicing
+	 * itself.  Being called with a non-zero offset is valid (e.g. FSKit
+	 * on macOS resuming an enumeration from a saved cookie with a fresh
+	 * directory handle) and must still produce the full listing --
+	 * returning nothing here would be interpreted as an empty directory
+	 * and make entries silently vanish.
+	 * See: https://github.com/libfuse/sshfs/issues/338
+	 */
+	(void) offset;
 
 	pthread_mutex_lock(&cache.lock);
 	node = cache_lookup(path);
@@ -421,7 +431,8 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	ch.dir = g_ptr_array_new();
 	g_ptr_array_set_free_func(ch.dir, free_cache_dirent);
 	ch.wrctr = cache_get_write_ctr();
-	err = cache.next_oper->readdir(path, &ch, cache_dirfill, offset, fi, flags);
+	/* Always request a fresh, complete enumeration to (re)fill the cache */
+	err = cache.next_oper->readdir(path, &ch, cache_dirfill, 0, fi, flags);
 	g_ptr_array_add(ch.dir, NULL);
 	dir = ch.dir;
 	if (!err) {
